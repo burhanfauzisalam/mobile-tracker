@@ -1,13 +1,18 @@
 import 'dart:async';
-import 'dart:convert';
 
-import 'package:battery_plus/battery_plus.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:mqtt_client/mqtt_client.dart';
-import 'package:mqtt_client/mqtt_server_client.dart';
+import 'package:permission_handler/permission_handler.dart';
 
-void main() {
+import 'background_service.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (!kIsWeb) {
+    await initializeBackgroundService();
+  }
   runApp(const MobileTrackerApp());
 }
 
@@ -41,32 +46,97 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
   final _brokerController = TextEditingController(text: 'mqtt.burhanfs.my.id');
   final _portController = TextEditingController(text: '1883');
   final _topicController =
-      TextEditingController(text: 'tracking/android/android-001/location');
+      TextEditingController(text: 'tracking/android/android-002/location');
   final _clientIdController = TextEditingController(
     text: 'mobile-tracker-${DateTime.now().millisecondsSinceEpoch}',
   );
   final _usernameController = TextEditingController();
   final _passwordController = TextEditingController();
 
-  final Battery _battery = Battery();
-  MqttServerClient? _client;
-  StreamSubscription<Position>? _positionSub;
-  Timer? _batteryTimer;
+  final FlutterBackgroundService _backgroundService =
+      FlutterBackgroundService();
+  StreamSubscription<dynamic>? _statusSubscription;
+  StreamSubscription<dynamic>? _payloadSubscription;
+
   bool _isStreaming = false;
   String _status = 'Disconnected';
   String? _errorMessage;
-  Position? _lastPosition;
-  DateTime? _lastPublish;
   String? _activeTopic;
-  String? _activeDeviceId;
-  String? _activeUser;
-  int? _batteryLevel;
+  DateTime? _lastPublish;
+  double? _lastLatitude;
+  double? _lastLongitude;
+  double? _lastSpeed;
+  int? _lastBattery;
+
+  @override
+  void initState() {
+    super.initState();
+    _setupServiceListeners();
+    _syncServiceState();
+  }
+
+  Future<void> _syncServiceState() async {
+    final running = await _backgroundService.isRunning();
+    if (!mounted) return;
+    setState(() {
+      _isStreaming = running;
+      _status = running
+          ? 'Background service aktif'
+          : 'Disconnected';
+    });
+  }
+
+  void _setupServiceListeners() {
+    _statusSubscription ??=
+        _backgroundService.on('status').listen((event) {
+      if (event == null || !mounted) return;
+      final status = event['status']?.toString() ?? _status;
+      setState(() {
+        _status = status;
+        if (status.toLowerCase().contains('streaming')) {
+          _isStreaming = true;
+        }
+        if (status.toLowerCase().contains('stopped') ||
+            status.toLowerCase().contains('disconnected')) {
+          _isStreaming = false;
+          _activeTopic = null;
+        }
+        _errorMessage = event['error']?.toString();
+        if (event['topic'] != null) {
+          _activeTopic = event['topic'].toString();
+        }
+      });
+    });
+
+    _payloadSubscription ??=
+        _backgroundService.on('last_payload').listen((event) {
+      if (event == null || !mounted) return;
+      setState(() {
+        _isStreaming = true;
+        _lastLatitude = (event['latitude'] as num?)?.toDouble();
+        _lastLongitude = (event['longitude'] as num?)?.toDouble();
+        _lastSpeed = (event['speed'] as num?)?.toDouble();
+        _lastBattery = (event['battery'] as num?)?.toInt();
+        final ts = event['timestamp'];
+        if (ts is int) {
+          _lastPublish = DateTime.fromMillisecondsSinceEpoch(
+            ts * 1000,
+            isUtc: true,
+          ).toLocal();
+        } else if (ts is String) {
+          _lastPublish = DateTime.tryParse(ts);
+        }
+        if (event['topic'] != null) {
+          _activeTopic = event['topic'].toString();
+        }
+      });
+    });
+  }
 
   @override
   void dispose() {
-    _positionSub?.cancel();
-    _client?.disconnect();
-    _batteryTimer?.cancel();
+    _statusSubscription?.cancel();
+    _payloadSubscription?.cancel();
     _deviceIdController.dispose();
     _userController.dispose();
     _brokerController.dispose();
@@ -79,19 +149,24 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
   }
 
   Future<void> _toggleStreaming() async {
-    if (_isStreaming) {
+    if (_isStreaming || await _backgroundService.isRunning()) {
       await _stopStreaming();
     } else {
       final isValid = _formKey.currentState?.validate() ?? false;
-      if (!isValid) {
-        return;
-      }
+      if (!isValid) return;
       await _startStreaming();
     }
   }
 
   Future<void> _startStreaming() async {
     FocusScope.of(context).unfocus();
+    if (kIsWeb) {
+      setState(() {
+        _status = 'Layanan background tidak tersedia di Web';
+        _errorMessage = 'Jalankan aplikasi di perangkat Android/iOS.';
+      });
+      return;
+    }
     setState(() {
       _status = 'Checking GPS permission...';
       _errorMessage = null;
@@ -99,6 +174,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
 
     try {
       await _ensureLocationPermission();
+      await _ensureNotificationPermission();
     } catch (error) {
       setState(() {
         _status = 'Permission error';
@@ -107,64 +183,27 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
       return;
     }
 
-    final client = await _connectMqtt();
-    if (client == null) {
-      return;
+    _setupServiceListeners();
+    final running = await _backgroundService.isRunning();
+    if (!running) {
+      await _backgroundService.startService();
     }
-
-    final topic = _topicController.text.trim();
-    final deviceId = _deviceIdController.text.trim();
-    final user = _userController.text.trim();
-    final locationSettings = const LocationSettings(
-      accuracy: LocationAccuracy.bestForNavigation,
-      distanceFilter: 5,
-    );
+    final config = _buildServiceConfig();
+    _backgroundService.invoke('config', config);
 
     setState(() {
-      _client = client;
       _isStreaming = true;
-      _status = 'Streaming location...';
-      _activeTopic = topic;
-      _activeDeviceId = deviceId;
-      _activeUser = user;
+      _status = 'Starting background service...';
+      _activeTopic = config['topic']?.toString();
     });
-
-    await _startBatteryUpdates();
-
-    // Send an initial reading immediately.
-    try {
-      final currentPosition = await Geolocator.getCurrentPosition();
-      _publishPosition(currentPosition);
-    } catch (_) {
-      // Ignore when immediate fix is unavailable.
-    }
-
-    _positionSub = Geolocator.getPositionStream(
-      locationSettings: locationSettings,
-    ).listen(
-      _publishPosition,
-      onError: (error) {
-        if (!mounted) return;
-        setState(() {
-          _errorMessage = 'Location error: $error';
-        });
-      },
-    );
   }
 
   Future<void> _stopStreaming() async {
-    await _positionSub?.cancel();
-    _positionSub = null;
-    _client?.disconnect();
-    _batteryTimer?.cancel();
-    _batteryTimer = null;
+    _backgroundService.invoke('stopService');
     setState(() {
-      _client = null;
       _isStreaming = false;
       _status = 'Disconnected';
       _activeTopic = null;
-      _activeDeviceId = null;
-      _activeUser = null;
     });
   }
 
@@ -178,132 +217,44 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
     }
-
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
+    if (permission == LocationPermission.whileInUse) {
+      permission = await Geolocator.requestPermission();
+    }
+    if (permission != LocationPermission.always) {
       throw Exception(
-        'Izin lokasi diperlukan untuk mengirim data GPS. '
-        'Aktifkan melalui pengaturan perangkat.',
+        'Izin lokasi "Allow all the time" diperlukan untuk tracking background.',
       );
     }
   }
 
-  Future<MqttServerClient?> _connectMqtt() async {
-    final broker = _brokerController.text.trim();
+  Future<void> _ensureNotificationPermission() async {
+    if (kIsWeb) return;
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    final status = await Permission.notification.status;
+    if (status.isGranted || status.isLimited) {
+      return;
+    }
+    final result = await Permission.notification.request();
+    if (!result.isGranted) {
+      throw Exception(
+        'Izin notifikasi diperlukan agar layanan foreground dapat berjalan.',
+      );
+    }
+  }
+
+  Map<String, dynamic> _buildServiceConfig() {
     final port = int.tryParse(_portController.text.trim()) ?? 1883;
-    final username = _usernameController.text.trim();
-    final password = _passwordController.text;
-    final clientId = _clientIdText;
-
-    final client = MqttServerClient(broker, clientId)
-      ..port = port
-      ..logging(on: false)
-      ..keepAlivePeriod = 30
-      ..onDisconnected = _handleDisconnected;
-
-    client.connectionMessage = MqttConnectMessage()
-        .withClientIdentifier(clientId)
-        .withWillQos(MqttQos.atLeastOnce)
-        .startClean();
-
-    setState(() {
-      _status = 'Connecting to MQTT...';
-    });
-
-    try {
-      await client.connect(
-        username.isEmpty ? null : username,
-        password.isEmpty ? null : password,
-      );
-      return client;
-    } on NoConnectionException catch (error) {
-      client.disconnect();
-      setState(() {
-        _status = 'MQTT connection failed';
-        _errorMessage = error.toString();
-      });
-    } catch (error) {
-      client.disconnect();
-      setState(() {
-        _status = 'MQTT connection failed';
-        _errorMessage = error.toString();
-      });
-    }
-    return null;
-  }
-
-  Future<void> _startBatteryUpdates() async {
-    await _updateBatteryLevel();
-    _batteryTimer?.cancel();
-    _batteryTimer = Timer.periodic(
-      const Duration(minutes: 1),
-      (_) => _updateBatteryLevel(),
-    );
-  }
-
-  Future<void> _updateBatteryLevel() async {
-    try {
-      final level = await _battery.batteryLevel;
-      if (!mounted) return;
-      setState(() {
-        _batteryLevel = level;
-      });
-    } catch (_) {
-      // Ignore battery plugin failures.
-    }
-  }
-
-  void _handleDisconnected() {
-    _positionSub?.cancel();
-    _positionSub = null;
-    _batteryTimer?.cancel();
-    _batteryTimer = null;
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _client = null;
-      _isStreaming = false;
-      _status = 'Disconnected';
-      _activeTopic = null;
-      _activeDeviceId = null;
-      _activeUser = null;
-    });
-  }
-
-  void _publishPosition(Position position) {
-    final client = _client;
-    final topic = _activeTopic;
-    if (client == null || topic == null) {
-      return;
-    }
-
-    final deviceId = _activeDeviceId ?? _deviceIdController.text.trim();
-    final user = _activeUser ?? _userController.text.trim();
-    final timestamp = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-
-    final payload = jsonEncode({
-      'device_id': deviceId,
-      'user': user,
-      'latitude': position.latitude,
-      'longitude': position.longitude,
-      'accuracy': position.accuracy,
-      'speed': position.speed,
-      'bearing': position.heading,
-      'battery': _batteryLevel ?? -1,
-      'timestamp': timestamp,
-    });
-
-    final builder = MqttClientPayloadBuilder()..addUTF8String(payload);
-    client.publishMessage(topic, MqttQos.atLeastOnce, builder.payload!);
-
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _lastPosition = position;
-      _lastPublish = DateTime.now();
-    });
+    return {
+      'device_id': _deviceIdController.text.trim(),
+      'user': _userController.text.trim(),
+      'broker': _brokerController.text.trim(),
+      'port': port,
+      'topic': _topicController.text.trim(),
+      'client_id': _clientIdText,
+      'username': _usernameController.text.trim(),
+      'password': _passwordController.text,
+      'interval_seconds': 15,
+    };
   }
 
   String get _clientIdText {
@@ -413,17 +364,22 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
                       color: _isStreaming ? Colors.green : Colors.red,
                     ),
                     title: const Text('Status'),
-                    subtitle: Text(_status),
+                    subtitle: Text(
+                      _activeTopic == null
+                          ? _status
+                          : '$_status\nTopic: $_activeTopic',
+                    ),
                   ),
                 ),
-                if (_lastPosition != null)
+                if (_lastLatitude != null && _lastLongitude != null)
                   Card(
                     child: ListTile(
                       title: const Text('Data GPS terakhir'),
                       subtitle: Text(
-                        'Lat: ${_lastPosition!.latitude.toStringAsFixed(6)}\n'
-                        'Lng: ${_lastPosition!.longitude.toStringAsFixed(6)}\n'
-                        'Speed: ${_lastPosition!.speed.toStringAsFixed(2)} m/s',
+                        'Lat: ${_lastLatitude!.toStringAsFixed(6)}\n'
+                        'Lng: ${_lastLongitude!.toStringAsFixed(6)}\n'
+                        'Speed: ${(_lastSpeed ?? 0).toStringAsFixed(2)} m/s\n'
+                        'Battery: ${_lastBattery ?? 0}%',
                       ),
                       trailing: Text(
                         _lastPublish?.toLocal().toIso8601String() ?? '',
@@ -433,14 +389,15 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
                   ),
                 if (_errorMessage != null)
                   Card(
-                    color:
-                        Theme.of(context).colorScheme.errorContainer,
+                    color: Theme.of(context).colorScheme.errorContainer,
                     child: ListTile(
                       leading: Icon(
                         Icons.warning,
-                        color: Theme.of(context).colorScheme.onErrorContainer,
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onErrorContainer,
                       ),
-                      title: Text(
+                      subtitle: Text(
                         _errorMessage!,
                         style: TextStyle(
                           color: Theme.of(context)
