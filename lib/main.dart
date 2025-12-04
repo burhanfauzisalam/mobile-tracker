@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
@@ -7,6 +8,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'background_service.dart';
+import 'mqtt_settings_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -40,9 +42,8 @@ class TrackerHomePage extends StatefulWidget {
 }
 
 class _TrackerHomePageState extends State<TrackerHomePage> {
-  final _formKey = GlobalKey<FormState>();
   final _deviceIdController = TextEditingController(text: 'android-001');
-  final _userController = TextEditingController(text: 'driver-1');
+  final _userController = TextEditingController(text: 'mobile-device');
   final _brokerController = TextEditingController(text: 'mqtt.burhanfs.my.id');
   final _portController = TextEditingController(text: '1883');
   final _topicController =
@@ -59,6 +60,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
   StreamSubscription<dynamic>? _payloadSubscription;
 
   bool _isStreaming = false;
+  bool _autoStartScheduled = false;
   String _status = 'Disconnected';
   String? _errorMessage;
   String? _activeTopic;
@@ -73,6 +75,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     super.initState();
     _setupServiceListeners();
     _syncServiceState();
+    _scheduleAutoStart();
   }
 
   Future<void> _syncServiceState() async {
@@ -148,16 +151,6 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     super.dispose();
   }
 
-  Future<void> _toggleStreaming() async {
-    if (_isStreaming || await _backgroundService.isRunning()) {
-      await _stopStreaming();
-    } else {
-      final isValid = _formKey.currentState?.validate() ?? false;
-      if (!isValid) return;
-      await _startStreaming();
-    }
-  }
-
   Future<void> _startStreaming() async {
     FocusScope.of(context).unfocus();
     if (kIsWeb) {
@@ -195,15 +188,6 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
       _isStreaming = true;
       _status = 'Starting background service...';
       _activeTopic = config['topic']?.toString();
-    });
-  }
-
-  Future<void> _stopStreaming() async {
-    _backgroundService.invoke('stopService');
-    setState(() {
-      _isStreaming = false;
-      _status = 'Disconnected';
-      _activeTopic = null;
     });
   }
 
@@ -257,6 +241,175 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     };
   }
 
+  bool _hasValidMqttConfig() {
+    return _deviceIdController.text.trim().isNotEmpty &&
+        _userController.text.trim().isNotEmpty &&
+        _brokerController.text.trim().isNotEmpty &&
+        _portController.text.trim().isNotEmpty &&
+        _topicController.text.trim().isNotEmpty;
+  }
+
+  void _scheduleAutoStart() {
+    if (_autoStartScheduled) return;
+    _autoStartScheduled = true;
+    Future.microtask(() async {
+      await _populateUserFromDevice();
+      if (!_hasValidMqttConfig()) return;
+      await _startStreaming();
+    });
+  }
+
+  Future<void> _populateUserFromDevice() async {
+    const fallback = 'mobile-device';
+    if (kIsWeb) {
+      _userController.text = fallback;
+      return;
+    }
+    try {
+      final deviceInfo = DeviceInfoPlugin();
+      String? resolved;
+      String sanitize(String? value) => value?.trim() ?? '';
+      switch (defaultTargetPlatform) {
+        case TargetPlatform.android:
+          final info = await deviceInfo.androidInfo;
+          final manufacturer = sanitize(info.manufacturer);
+          final model = sanitize(info.model);
+          final fallbackId = sanitize(info.device).isNotEmpty
+              ? sanitize(info.device)
+              : sanitize(info.id);
+          final pieces = <String>[
+            if (manufacturer.isNotEmpty) manufacturer,
+            if (model.isNotEmpty) model,
+          ];
+          resolved = pieces.join(' ').trim();
+          if (resolved.isEmpty) {
+            resolved = fallbackId.isNotEmpty ? fallbackId : fallback;
+          }
+          break;
+        case TargetPlatform.iOS:
+          final info = await deviceInfo.iosInfo;
+          resolved = sanitize(info.name);
+          if (resolved.isEmpty) {
+            resolved = sanitize(info.utsname.machine);
+          }
+          break;
+        default:
+          resolved = defaultTargetPlatform.name;
+          break;
+      }
+      if (!mounted) return;
+      _userController.text =
+          (resolved == null || resolved.isEmpty) ? fallback : resolved;
+    } catch (_) {
+      if (!mounted) return;
+      _userController.text = fallback;
+    }
+  }
+
+  Future<void> _openMqttSettings() async {
+    await _navigateWithLoading(() async {
+      await Navigator.of(context).push<bool>(
+        MaterialPageRoute(
+          builder: (_) => MqttSettingsPage(
+            deviceIdController: _deviceIdController,
+            userController: _userController,
+            brokerController: _brokerController,
+            portController: _portController,
+            topicController: _topicController,
+            clientIdController: _clientIdController,
+            usernameController: _usernameController,
+            passwordController: _passwordController,
+          ),
+        ),
+      );
+    });
+    if (!mounted) return;
+    setState(() {});
+    if (_hasValidMqttConfig()) {
+      await _startStreaming();
+    }
+  }
+
+  Future<void> _navigateWithLoading(Future<void> Function() action) async {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const _LoadingDialog(),
+    );
+    await Future.delayed(const Duration(milliseconds: 600));
+    if (!mounted) return;
+    Navigator.of(context, rootNavigator: true).pop();
+    await action();
+  }
+
+  Widget _buildMqttSettingsCard() {
+    final broker = _brokerController.text.trim();
+    final port = _portController.text.trim();
+    final topic = _topicController.text.trim();
+    final clientId = _clientIdController.text.trim();
+    final subtitle = [
+      'Broker: ${broker.isEmpty ? '-' : broker}',
+      'Port: ${port.isEmpty ? '1883' : port}',
+      'Topic: ${topic.isEmpty ? '-' : topic}',
+      'Client ID: ${clientId.isEmpty ? 'auto' : clientId}',
+    ].join('\n');
+    return Card(
+      child: ListTile(
+        leading: const Icon(Icons.settings_input_antenna),
+        title: const Text('Pengaturan MQTT'),
+        subtitle: Text(subtitle),
+      ),
+    );
+  }
+
+  Widget _buildStreamingInfoCard() {
+    return Card(
+      child: ListTile(
+        leading: Icon(
+          Icons.play_circle_fill,
+          color: _isStreaming ? Colors.green : Colors.orange,
+        ),
+        title: const Text('Streaming lokasi berjalan otomatis'),
+        subtitle: Text(
+          _isStreaming
+              ? 'Layanan background aktif dan mengirim lokasi.'
+              : 'Menunggu layanan background...',
+        ),
+      ),
+    );
+  }
+  Drawer _buildNavigationDrawer() {
+    return Drawer(
+      child: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 24),
+          children: [
+            ListTile(
+              leading: const Icon(Icons.home),
+              title: const Text('Home'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () {
+                Navigator.of(context).pop();
+              },
+              selected: true,
+            ),
+            const Divider(),
+            ListTile(
+              leading: const Icon(Icons.settings),
+              title: const Text('Setting'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () async {
+                Navigator.of(context).pop();
+                await _openMqttSettings();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   String get _clientIdText {
     final value = _clientIdController.text.trim();
     if (value.isNotEmpty) {
@@ -271,169 +424,100 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
       appBar: AppBar(
         title: const Text('Mobile GPS Tracker'),
       ),
+      drawer: _buildNavigationDrawer(),
       body: GestureDetector(
         onTap: () => FocusScope.of(context).unfocus(),
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(16),
-          child: Form(
-            key: _formKey,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _buildTextField(
-                  controller: _deviceIdController,
-                  label: 'Device ID',
-                  validator: (value) {
-                    if (value == null || value.trim().isEmpty) {
-                      return 'Device ID wajib diisi';
-                    }
-                    return null;
-                  },
-                ),
-                _buildTextField(
-                  controller: _userController,
-                  label: 'User',
-                  validator: (value) {
-                    if (value == null || value.trim().isEmpty) {
-                      return 'User wajib diisi';
-                    }
-                    return null;
-                  },
-                ),
-                _buildTextField(
-                  controller: _brokerController,
-                  label: 'MQTT Broker',
-                  hint: 'contoh: test.mosquitto.org',
-                  validator: (value) {
-                    if (value == null || value.trim().isEmpty) {
-                      return 'Broker tidak boleh kosong';
-                    }
-                    return null;
-                  },
-                ),
-                _buildTextField(
-                  controller: _portController,
-                  label: 'Port',
-                  keyboardType: TextInputType.number,
-                  validator: (value) {
-                    final number = int.tryParse(value ?? '');
-                    if (number == null || number <= 0) {
-                      return 'Gunakan port yang valid';
-                    }
-                    return null;
-                  },
-                ),
-                _buildTextField(
-                  controller: _topicController,
-                  label: 'Topic',
-                  hint: 'contoh: devices/mobile_tracker',
-                  validator: (value) {
-                    if (value == null || value.trim().isEmpty) {
-                      return 'Topic tidak boleh kosong';
-                    }
-                    return null;
-                  },
-                ),
-                _buildTextField(
-                  controller: _clientIdController,
-                  label: 'Client ID',
-                  hint: 'Opsional, otomatis jika dikosongkan',
-                ),
-                _buildTextField(
-                  controller: _usernameController,
-                  label: 'Username (opsional)',
-                ),
-                _buildTextField(
-                  controller: _passwordController,
-                  label: 'Password (opsional)',
-                  obscureText: true,
-                ),
-                const SizedBox(height: 16),
-                FilledButton.icon(
-                  onPressed: _toggleStreaming,
-                  icon: Icon(_isStreaming ? Icons.stop : Icons.play_arrow),
-                  label: Text(
-                    _isStreaming ? 'Stop Streaming' : 'Start Streaming',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildMqttSettingsCard(),
+              const SizedBox(height: 12),
+              _buildStreamingInfoCard(),
+              const SizedBox(height: 16),
+              Card(
+                child: ListTile(
+                  leading: Icon(
+                    _isStreaming ? Icons.cloud_done : Icons.cloud_off,
+                    color: _isStreaming ? Colors.green : Colors.red,
+                  ),
+                  title: const Text('Status'),
+                  subtitle: Text(
+                    _activeTopic == null
+                        ? _status
+                        : '$_status\nTopic: $_activeTopic',
                   ),
                 ),
-                const SizedBox(height: 16),
+              ),
+              if (_lastLatitude != null && _lastLongitude != null)
                 Card(
                   child: ListTile(
-                    leading: Icon(
-                      _isStreaming ? Icons.cloud_done : Icons.cloud_off,
-                      color: _isStreaming ? Colors.green : Colors.red,
-                    ),
-                    title: const Text('Status'),
+                    title: const Text('Data GPS terakhir'),
                     subtitle: Text(
-                      _activeTopic == null
-                          ? _status
-                          : '$_status\nTopic: $_activeTopic',
+                      'Lat: ${_lastLatitude!.toStringAsFixed(6)}\n'
+                      'Lng: ${_lastLongitude!.toStringAsFixed(6)}\n'
+                      'Speed: ${(_lastSpeed ?? 0).toStringAsFixed(2)} m/s\n'
+                      'Battery: ${_lastBattery ?? 0}%',
+                    ),
+                    trailing: Text(
+                      _lastPublish?.toLocal().toIso8601String() ?? '',
+                      style: Theme.of(context).textTheme.bodySmall,
                     ),
                   ),
                 ),
-                if (_lastLatitude != null && _lastLongitude != null)
-                  Card(
-                    child: ListTile(
-                      title: const Text('Data GPS terakhir'),
-                      subtitle: Text(
-                        'Lat: ${_lastLatitude!.toStringAsFixed(6)}\n'
-                        'Lng: ${_lastLongitude!.toStringAsFixed(6)}\n'
-                        'Speed: ${(_lastSpeed ?? 0).toStringAsFixed(2)} m/s\n'
-                        'Battery: ${_lastBattery ?? 0}%',
-                      ),
-                      trailing: Text(
-                        _lastPublish?.toLocal().toIso8601String() ?? '',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
+              if (_errorMessage != null)
+                Card(
+                  color: Theme.of(context).colorScheme.errorContainer,
+                  child: ListTile(
+                    leading: Icon(
+                      Icons.warning,
+                      color:
+                          Theme.of(context).colorScheme.onErrorContainer,
                     ),
-                  ),
-                if (_errorMessage != null)
-                  Card(
-                    color: Theme.of(context).colorScheme.errorContainer,
-                    child: ListTile(
-                      leading: Icon(
-                        Icons.warning,
+                    subtitle: Text(
+                      _errorMessage!,
+                      style: TextStyle(
                         color: Theme.of(context)
                             .colorScheme
                             .onErrorContainer,
                       ),
-                      subtitle: Text(
-                        _errorMessage!,
-                        style: TextStyle(
-                          color: Theme.of(context)
-                              .colorScheme
-                              .onErrorContainer,
-                        ),
-                      ),
                     ),
                   ),
-              ],
-            ),
+                ),
+            ],
           ),
         ),
       ),
     );
   }
+}
 
-  Widget _buildTextField({
-    required TextEditingController controller,
-    required String label,
-    String? hint,
-    TextInputType? keyboardType,
-    bool obscureText = false,
-    String? Function(String?)? validator,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: TextFormField(
-        controller: controller,
-        keyboardType: keyboardType,
-        obscureText: obscureText,
-        validator: validator,
-        decoration: InputDecoration(
-          labelText: label,
-          hintText: hint,
-          border: const OutlineInputBorder(),
+class _LoadingDialog extends StatelessWidget {
+  const _LoadingDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Dialog(
+      backgroundColor: Colors.transparent,
+      elevation: 0,
+      child: Center(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.all(Radius.circular(12)),
+          ),
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 12),
+                Text('Loading...'),
+              ],
+            ),
+          ),
         ),
       ),
     );
