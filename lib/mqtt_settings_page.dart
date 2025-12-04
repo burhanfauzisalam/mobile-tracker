@@ -11,6 +11,7 @@ class MqttSettingsPage extends StatefulWidget {
     required this.clientIdController,
     required this.usernameController,
     required this.passwordController,
+    this.hideConnectionFields = false,
   });
 
   final TextEditingController deviceIdController;
@@ -21,6 +22,7 @@ class MqttSettingsPage extends StatefulWidget {
   final TextEditingController clientIdController;
   final TextEditingController usernameController;
   final TextEditingController passwordController;
+  final bool hideConnectionFields;
 
   @override
   State<MqttSettingsPage> createState() => _MqttSettingsPageState();
@@ -31,6 +33,85 @@ class _MqttSettingsPageState extends State<MqttSettingsPage> {
 
   @override
   Widget build(BuildContext context) {
+    final children = <Widget>[
+      _buildField(
+        controller: widget.deviceIdController,
+        label: 'Device ID',
+        validator: _requiredValidator,
+      ),
+      _buildField(
+        controller: widget.userController,
+        label: 'User',
+        hint: 'Diisi otomatis dari nama perangkat',
+        enabled: false,
+      ),
+    ];
+
+    if (widget.hideConnectionFields) {
+      children.addAll([
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.lock),
+            title: const Text('Pengaturan MQTT dikunci'),
+            subtitle: const Text(
+              'Broker, port, topic, username, dan password diatur otomatis oleh server.',
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+      ]);
+    } else {
+      children.addAll([
+        _buildField(
+          controller: widget.brokerController,
+          label: 'MQTT Broker',
+          hint: 'contoh: test.mosquitto.org',
+          validator: _requiredValidator,
+        ),
+        _buildField(
+          controller: widget.portController,
+          label: 'Port',
+          keyboardType: TextInputType.number,
+          validator: (value) {
+            final number = int.tryParse(value ?? '');
+            if (number == null || number <= 0) {
+              return 'Gunakan port yang valid';
+            }
+            return null;
+          },
+        ),
+        _buildField(
+          controller: widget.topicController,
+          label: 'Topic',
+          hint: 'contoh: devices/mobile_tracker',
+          validator: _requiredValidator,
+        ),
+        _buildField(
+          controller: widget.clientIdController,
+          label: 'Client ID',
+          hint: 'Opsional, otomatis jika dikosongkan',
+        ),
+        _buildField(
+          controller: widget.usernameController,
+          label: 'Username (opsional)',
+        ),
+        _buildField(
+          controller: widget.passwordController,
+          label: 'Password (opsional)',
+          obscureText: true,
+        ),
+        const SizedBox(height: 16),
+      ]);
+    }
+
+    children.add(
+      FilledButton.icon(
+        onPressed: _handleSave,
+        icon: const Icon(Icons.save),
+        label: const Text('Simpan'),
+      ),
+    );
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Pengaturan MQTT'),
@@ -41,63 +122,7 @@ class _MqttSettingsPageState extends State<MqttSettingsPage> {
           key: _formKey,
           child: ListView(
             padding: const EdgeInsets.all(16),
-            children: [
-              _buildField(
-                controller: widget.deviceIdController,
-                label: 'Device ID',
-                validator: _requiredValidator,
-              ),
-              _buildField(
-                controller: widget.userController,
-                label: 'User',
-                hint: 'Diisi otomatis dari nama perangkat',
-                enabled: false,
-              ),
-              _buildField(
-                controller: widget.brokerController,
-                label: 'MQTT Broker',
-                hint: 'contoh: test.mosquitto.org',
-                validator: _requiredValidator,
-              ),
-              _buildField(
-                controller: widget.portController,
-                label: 'Port',
-                keyboardType: TextInputType.number,
-                validator: (value) {
-                  final number = int.tryParse(value ?? '');
-                  if (number == null || number <= 0) {
-                    return 'Gunakan port yang valid';
-                  }
-                  return null;
-                },
-              ),
-              _buildField(
-                controller: widget.topicController,
-                label: 'Topic',
-                hint: 'contoh: devices/mobile_tracker',
-                validator: _requiredValidator,
-              ),
-              _buildField(
-                controller: widget.clientIdController,
-                label: 'Client ID',
-                hint: 'Opsional, otomatis jika dikosongkan',
-              ),
-              _buildField(
-                controller: widget.usernameController,
-                label: 'Username (opsional)',
-              ),
-              _buildField(
-                controller: widget.passwordController,
-                label: 'Password (opsional)',
-                obscureText: true,
-              ),
-              const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: _handleSave,
-                icon: const Icon(Icons.save),
-                label: const Text('Simpan'),
-              ),
-            ],
+            children: children,
           ),
         ),
       ),

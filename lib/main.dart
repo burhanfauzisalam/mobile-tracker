@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
@@ -6,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:http/http.dart' as http;
 
 import 'background_service.dart';
 import 'mqtt_settings_page.dart';
@@ -53,6 +55,11 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
   );
   final _usernameController = TextEditingController();
   final _passwordController = TextEditingController();
+  static const String _mqttConfigEndpoint =
+      'https://apps.burhanfs.my.id/tracker/api/mqtt-connections';
+  Future<void>? _mqttConfigLoadFuture;
+  bool _mqttConfigLoaded = false;
+  bool _mqttConfigFromApi = false;
 
   final FlutterBackgroundService _backgroundService =
       FlutterBackgroundService();
@@ -75,6 +82,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     super.initState();
     _setupServiceListeners();
     _syncServiceState();
+    unawaited(_ensureMqttConfigLoaded());
     _scheduleAutoStart();
   }
 
@@ -134,6 +142,76 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
         }
       });
     });
+  }
+
+  Future<void> _ensureMqttConfigLoaded() async {
+    if (_mqttConfigLoaded) return;
+    _mqttConfigLoadFuture ??= _loadMqttConfigFromApi();
+    await _mqttConfigLoadFuture;
+  }
+
+  Future<void> _loadMqttConfigFromApi() async {
+    try {
+      if (!_isStreaming && mounted) {
+        setState(() {
+          _status = 'Mengambil konfigurasi MQTT...';
+          _errorMessage = null;
+        });
+      }
+      final response = await http
+          .get(Uri.parse(_mqttConfigEndpoint))
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode != 200) {
+        throw Exception('HTTP ${response.statusCode}');
+      }
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<String, dynamic>) {
+        throw Exception('Format respons tidak valid');
+      }
+      final data = decoded['data'];
+      if (data is! List || data.isEmpty) {
+        throw Exception('Data MQTT tidak ditemukan');
+      }
+      final config = Map<String, dynamic>.from(data.first as Map);
+      if (mounted) {
+        _applyRemoteMqttConfig(config);
+        setState(() {
+          _mqttConfigLoaded = true;
+          _mqttConfigFromApi = true;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _errorMessage = 'Gagal memuat pengaturan MQTT: $error';
+        });
+      }
+    } finally {
+      _mqttConfigLoadFuture = null;
+    }
+  }
+
+  void _applyRemoteMqttConfig(Map<String, dynamic> config) {
+    _brokerController.text = _stringValue(config['broker']);
+    _topicController.text = _stringValue(config['topic']);
+    final portText = _stringValue(config['port']);
+    _portController.text = portText.isEmpty ? '1883' : portText;
+    _usernameController.text = _stringValue(
+      config['username'],
+      trim: false,
+    );
+    _passwordController.text = _stringValue(
+      config['password'],
+      trim: false,
+    );
+  }
+
+  String _stringValue(
+    dynamic value, {
+    bool trim = true,
+  }) {
+    final text = value == null ? '' : value.toString();
+    return trim ? text.trim() : text;
   }
 
   @override
@@ -254,7 +332,8 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     _autoStartScheduled = true;
     Future.microtask(() async {
       await _populateUserFromDevice();
-      if (!_hasValidMqttConfig()) return;
+      await _ensureMqttConfigLoaded();
+      if (!_mqttConfigLoaded || !_hasValidMqttConfig()) return;
       await _startStreaming();
     });
   }
@@ -308,6 +387,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
 
   Future<void> _openMqttSettings() async {
     await _navigateWithLoading(() async {
+      await _ensureMqttConfigLoaded();
       await Navigator.of(context).push<bool>(
         MaterialPageRoute(
           builder: (_) => MqttSettingsPage(
@@ -319,6 +399,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
             clientIdController: _clientIdController,
             usernameController: _usernameController,
             passwordController: _passwordController,
+            hideConnectionFields: _mqttConfigFromApi,
           ),
         ),
       );
@@ -343,42 +424,42 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     await action();
   }
 
-  Widget _buildMqttSettingsCard() {
-    final broker = _brokerController.text.trim();
-    final port = _portController.text.trim();
-    final topic = _topicController.text.trim();
-    final clientId = _clientIdController.text.trim();
-    final subtitle = [
-      'Broker: ${broker.isEmpty ? '-' : broker}',
-      'Port: ${port.isEmpty ? '1883' : port}',
-      'Topic: ${topic.isEmpty ? '-' : topic}',
-      'Client ID: ${clientId.isEmpty ? 'auto' : clientId}',
-    ].join('\n');
-    return Card(
-      child: ListTile(
-        leading: const Icon(Icons.settings_input_antenna),
-        title: const Text('Pengaturan MQTT'),
-        subtitle: Text(subtitle),
-      ),
-    );
-  }
+  // Widget _buildMqttSettingsCard() {
+  //   final broker = _brokerController.text.trim();
+  //   final port = _portController.text.trim();
+  //   final topic = _topicController.text.trim();
+  //   final clientId = _clientIdController.text.trim();
+  //   final subtitle = [
+  //     'Broker: ${broker.isEmpty ? '-' : broker}',
+  //     'Port: ${port.isEmpty ? '1883' : port}',
+  //     'Topic: ${topic.isEmpty ? '-' : topic}',
+  //     'Client ID: ${clientId.isEmpty ? 'auto' : clientId}',
+  //   ].join('\n');
+  //   return Card(
+  //     child: ListTile(
+  //       leading: const Icon(Icons.settings_input_antenna),
+  //       title: const Text('Pengaturan MQTT'),
+  //       subtitle: Text(subtitle),
+  //     ),
+  //   );
+  // }
 
-  Widget _buildStreamingInfoCard() {
-    return Card(
-      child: ListTile(
-        leading: Icon(
-          Icons.play_circle_fill,
-          color: _isStreaming ? Colors.green : Colors.orange,
-        ),
-        title: const Text('Streaming lokasi berjalan otomatis'),
-        subtitle: Text(
-          _isStreaming
-              ? 'Layanan background aktif dan mengirim lokasi.'
-              : 'Menunggu layanan background...',
-        ),
-      ),
-    );
-  }
+  // Widget _buildStreamingInfoCard() {
+  //   return Card(
+  //     child: ListTile(
+  //       leading: Icon(
+  //         Icons.play_circle_fill,
+  //         color: _isStreaming ? Colors.green : Colors.orange,
+  //       ),
+  //       title: const Text('Streaming lokasi berjalan otomatis'),
+  //       subtitle: Text(
+  //         _isStreaming
+  //             ? 'Layanan background aktif dan mengirim lokasi.'
+  //             : 'Menunggu layanan background...',
+  //       ),
+  //     ),
+  //   );
+  // }
   Drawer _buildNavigationDrawer() {
     return Drawer(
       child: SafeArea(
@@ -432,10 +513,10 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _buildMqttSettingsCard(),
-              const SizedBox(height: 12),
-              _buildStreamingInfoCard(),
-              const SizedBox(height: 16),
+              // _buildMqttSettingsCard(),
+              // const SizedBox(height: 12),
+              // _buildStreamingInfoCard(),
+              // const SizedBox(height: 16),
               Card(
                 child: ListTile(
                   leading: Icon(
@@ -446,7 +527,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
                   subtitle: Text(
                     _activeTopic == null
                         ? _status
-                        : '$_status\nTopic: $_activeTopic',
+                        : '$_status',
                   ),
                 ),
               ),
