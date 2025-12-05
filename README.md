@@ -11,14 +11,7 @@ The tracker now relies on a background service so data keeps flowing every 15 se
    ```
 2. Enable developer options on the Android device/emulator and ensure GPS is turned on.
 3. Run the app on a physical device (`flutter run`). The Chrome/web target is not supported for background tracking.
-4. Fill in:
-   - Device ID and user identifier.
-   - MQTT host/port/topic plus optional username/password/client id.
-5. Tap **Start Streaming**. The app will:
-   - Request `Allow all the time` location permission and background access.
-   - Start an Android foreground service that pushes a JSON payload every 15 seconds via MQTT.
 
-To stop the service, tap **Stop Streaming** (this sends a `stopService` command to the background isolate).
 
 ## Android/iOS notes
 

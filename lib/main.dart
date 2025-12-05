@@ -378,7 +378,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
       }
       if (!mounted) return;
       _userController.text =
-          (resolved == null || resolved.isEmpty) ? fallback : resolved;
+          (resolved.isEmpty) ? fallback : resolved;
     } catch (_) {
       if (!mounted) return;
       _userController.text = fallback;
@@ -527,7 +527,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
                   subtitle: Text(
                     _activeTopic == null
                         ? _status
-                        : '$_status',
+                        : _status,
                   ),
                 ),
               ),

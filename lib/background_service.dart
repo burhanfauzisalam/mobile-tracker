@@ -54,12 +54,45 @@ void onStart(ServiceInstance service) async {
   TrackerConfig? config;
   MqttServerClient? client;
   Timer? ticker;
+  var allowReconnect = false;
+  var connecting = false;
+  var configVersion = 0;
+
+  Future<void> ensureConnected() async {
+    if (!allowReconnect || config == null || connecting) {
+      return;
+    }
+    connecting = true;
+    try {
+      final runVersion = configVersion;
+      final newClient = await _connectClient(
+        config!,
+        service,
+        onDisconnected: () {
+          client = null;
+          if (!allowReconnect) return;
+          unawaited(ensureConnected());
+        },
+      );
+      if (!allowReconnect || runVersion != configVersion) {
+        newClient?.disconnect();
+        return;
+      }
+      client = newClient;
+    } finally {
+      connecting = false;
+    }
+  }
 
   Future<void> stopTracking() async {
+    allowReconnect = false;
+    connecting = false;
     ticker?.cancel();
     ticker = null;
     client?.disconnect();
     client = null;
+    config = null;
+    configVersion++;
     service.invoke(_statusChannel, {'status': 'Stopped'});
     if (service is AndroidServiceInstance) {
       await service.setForegroundNotificationInfo(
@@ -73,19 +106,29 @@ void onStart(ServiceInstance service) async {
     if (event == null) return;
     await stopTracking();
     config = TrackerConfig.fromMap(Map<String, dynamic>.from(event));
+    allowReconnect = true;
     if (service is AndroidServiceInstance) {
       await service.setAsForegroundService();
     }
-    client = await _connectClient(config!, service);
-    if (client == null) {
-      return;
-    }
 
     Future<void> tick() async {
+      if (!allowReconnect) return;
+      final currentConfig = config;
+      if (currentConfig == null) return;
+      final needsReconnect = client == null ||
+          client!.connectionStatus?.state != MqttConnectionState.connected;
+      if (needsReconnect) {
+        await ensureConnected();
+      }
+      final readyClient = client;
+      if (readyClient == null ||
+          readyClient.connectionStatus?.state != MqttConnectionState.connected) {
+        return;
+      }
       await _sendLocationUpdate(
         service: service,
-        client: client!,
-        config: config!,
+        client: readyClient,
+        config: currentConfig,
         battery: battery,
       );
     }
@@ -106,7 +149,7 @@ void onStart(ServiceInstance service) async {
 Future<MqttServerClient?> _connectClient(
   TrackerConfig config,
   ServiceInstance service,
-) async {
+    {VoidCallback? onDisconnected}) async {
   final client = MqttServerClient(config.broker, config.clientId)
     ..port = config.port
     ..keepAlivePeriod = 30
@@ -119,6 +162,7 @@ Future<MqttServerClient?> _connectClient(
 
   client.onDisconnected = () {
     service.invoke(_statusChannel, {'status': 'MQTT disconnected'});
+    onDisconnected?.call();
   };
 
   try {
