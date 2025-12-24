@@ -12,7 +12,7 @@ The tracker now relies on a background service so data keeps flowing every 15 se
 2. Enable developer options on the Android device/emulator and ensure GPS is turned on.
 3. Run the app on a physical device (`flutter run`). The Chrome/web target is not supported for background tracking.
 
-
+.
 ## Android/iOS notes
 
 - Android manifests include `ACCESS_BACKGROUND_LOCATION`, `FOREGROUND_SERVICE`, and `POST_NOTIFICATIONS`. On Android 13+ the user must also approve the runtime notification permission for the service notification to appear.
