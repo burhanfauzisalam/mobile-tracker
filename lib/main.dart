@@ -71,11 +71,9 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
   String _status = 'Disconnected';
   String? _errorMessage;
   String? _activeTopic;
-  DateTime? _lastPublish;
-  double? _lastLatitude;
-  double? _lastLongitude;
-  double? _lastSpeed;
-  int? _lastBattery;
+  int _pendingBuffered = 0;
+  final List<_GpsLogEntry> _sentGps = <_GpsLogEntry>[];
+  final List<_GpsLogEntry> _pendingGps = <_GpsLogEntry>[];
 
   @override
   void initState() {
@@ -111,10 +109,20 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
             status.toLowerCase().contains('disconnected')) {
           _isStreaming = false;
           _activeTopic = null;
+          _pendingBuffered = 0;
         }
         _errorMessage = event['error']?.toString();
         if (event['topic'] != null) {
           _activeTopic = event['topic'].toString();
+        }
+        final pending = event['pending'];
+        if (pending is int) {
+          _pendingBuffered = pending;
+        } else if (pending is String) {
+          final parsed = int.tryParse(pending);
+          if (parsed != null) {
+            _pendingBuffered = parsed;
+          }
         }
       });
     });
@@ -124,18 +132,65 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
       if (event == null || !mounted) return;
       setState(() {
         _isStreaming = true;
-        _lastLatitude = (event['latitude'] as num?)?.toDouble();
-        _lastLongitude = (event['longitude'] as num?)?.toDouble();
-        _lastSpeed = (event['speed'] as num?)?.toDouble();
-        _lastBattery = (event['battery'] as num?)?.toInt();
-        final ts = event['timestamp'];
-        if (ts is int) {
-          _lastPublish = DateTime.fromMillisecondsSinceEpoch(
-            ts * 1000,
+        final latitude = (event['latitude'] as num?)?.toDouble();
+        final longitude = (event['longitude'] as num?)?.toDouble();
+        final speed = (event['speed'] as num?)?.toDouble() ?? 0;
+        final battery = (event['battery'] as num?)?.toInt() ?? 0;
+        DateTime? takenAt;
+        final dateValue = event['date'];
+        if (dateValue is String) {
+          takenAt = DateTime.tryParse(dateValue)?.toLocal();
+        }
+        if (takenAt == null) {
+          final ts = event['timestamp'];
+          if (ts is int) {
+            takenAt = DateTime.fromMillisecondsSinceEpoch(
+              ts * 1000,
+              isUtc: true,
+            ).toLocal();
+          } else if (ts is String) {
+            takenAt = DateTime.tryParse(ts)?.toLocal();
+          }
+        }
+        DateTime? sentAt;
+        final sentValue = event['sent_at'];
+        if (sentValue is String) {
+          sentAt = DateTime.tryParse(sentValue)?.toLocal();
+        } else if (sentValue is int) {
+          sentAt = DateTime.fromMillisecondsSinceEpoch(
+            sentValue * 1000,
             isUtc: true,
           ).toLocal();
-        } else if (ts is String) {
-          _lastPublish = DateTime.tryParse(ts);
+        }
+        if (latitude != null && longitude != null && takenAt != null) {
+          final id = event['timestamp']?.toString() ?? takenAt.toIso8601String();
+          final entry = _GpsLogEntry(
+            id: id,
+            latitude: latitude,
+            longitude: longitude,
+            speed: speed,
+            battery: battery,
+            takenAt: takenAt,
+            sentAt: sentAt,
+          );
+          const maxEntries = 100;
+          if (sentAt == null) {
+            _pendingGps.removeWhere((e) => e.id == id);
+            _pendingGps.insert(0, entry);
+            if (_pendingGps.length > maxEntries) {
+              _pendingGps.removeRange(maxEntries, _pendingGps.length);
+            }
+          } else {
+            final pendingIndex =
+                _pendingGps.indexWhere((e) => e.id == id);
+            if (pendingIndex != -1) {
+              _pendingGps.removeAt(pendingIndex);
+            }
+            _sentGps.insert(0, entry);
+            if (_sentGps.length > maxEntries) {
+              _sentGps.removeRange(maxEntries, _sentGps.length);
+            }
+          }
         }
         if (event['topic'] != null) {
           _activeTopic = event['topic'].toString();
@@ -315,7 +370,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
       'client_id': _clientIdText,
       'username': _usernameController.text.trim(),
       'password': _passwordController.text,
-      'interval_seconds': 15,
+      'interval_seconds': 10,
     };
   }
 
@@ -524,26 +579,120 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
                     color: _isStreaming ? Colors.green : Colors.red,
                   ),
                   title: const Text('Status'),
-                  subtitle: Text(
-                    _activeTopic == null
-                        ? _status
-                        : _status,
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(_status),
+                      if (_pendingBuffered > 0)
+                        Text(
+                          'Data offline tertunda: $_pendingBuffered',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                    ],
                   ),
                 ),
               ),
-              if (_lastLatitude != null && _lastLongitude != null)
+              if (_sentGps.isNotEmpty)
                 Card(
-                  child: ListTile(
-                    title: const Text('Data GPS terakhir'),
-                    subtitle: Text(
-                      'Lat: ${_lastLatitude!.toStringAsFixed(6)}\n'
-                      'Lng: ${_lastLongitude!.toStringAsFixed(6)}\n'
-                      'Speed: ${(_lastSpeed ?? 0).toStringAsFixed(2)} m/s\n'
-                      'Battery: ${_lastBattery ?? 0}%',
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Data GPS terkirim',
+                          style: TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          height: 220,
+                          child: ListView.builder(
+                            itemCount: _sentGps.length,
+                            itemBuilder: (context, index) {
+                              final entry = _sentGps[index];
+                              return ListTile(
+                                dense: true,
+                                contentPadding: EdgeInsets.zero,
+                                title: Text(
+                                  'Lat: ${entry.latitude.toStringAsFixed(6)}, '
+                                  'Lng: ${entry.longitude.toStringAsFixed(6)}',
+                                ),
+                                subtitle: Text(
+                                  'Speed: ${entry.speed.toStringAsFixed(2)} m/s  '
+                                  'Battery: ${entry.battery}%',
+                                ),
+                                trailing: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    Text(
+                                      entry.takenAt == null
+                                          ? 'Diambil: -'
+                                          : 'Diambil: ${entry.takenAt!.toIso8601String()}',
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall,
+                                    ),
+                                    Text(
+                                      entry.sentAt == null
+                                          ? 'Dikirim: -'
+                                          : 'Dikirim: ${entry.sentAt!.toIso8601String()}',
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall,
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
                     ),
-                    trailing: Text(
-                      _lastPublish?.toLocal().toIso8601String() ?? '',
-                      style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+              if (_pendingGps.isNotEmpty)
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Data GPS antrian (belum terkirim)',
+                          style: TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          height: 160,
+                          child: ListView.builder(
+                            itemCount: _pendingGps.length,
+                            itemBuilder: (context, index) {
+                              final entry = _pendingGps[index];
+                              return ListTile(
+                                dense: true,
+                                contentPadding: EdgeInsets.zero,
+                                title: Text(
+                                  'Lat: ${entry.latitude.toStringAsFixed(6)}, '
+                                  'Lng: ${entry.longitude.toStringAsFixed(6)}',
+                                ),
+                                subtitle: Text(
+                                  'Speed: ${entry.speed.toStringAsFixed(2)} m/s  '
+                                  'Battery: ${entry.battery}%',
+                                ),
+                                trailing: Text(
+                                  entry.takenAt == null
+                                      ? 'Diambil: -'
+                                      : 'Diambil: ${entry.takenAt!.toIso8601String()}',
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .bodySmall,
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -603,4 +752,24 @@ class _LoadingDialog extends StatelessWidget {
       ),
     );
   }
+}
+
+class _GpsLogEntry {
+  _GpsLogEntry({
+    required this.id,
+    required this.latitude,
+    required this.longitude,
+    required this.speed,
+    required this.battery,
+    required this.takenAt,
+    required this.sentAt,
+  });
+
+  final String id;
+  final double latitude;
+  final double longitude;
+  final double speed;
+  final int battery;
+  final DateTime? takenAt;
+  final DateTime? sentAt;
 }
